@@ -4,6 +4,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+	<IsTestProject>true</IsTestProject>
+	<PreserveCompilationContext>true</PreserveCompilationContext>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
@@ -12,11 +14,14 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
+	<PackageReference Include="NSubstitute" Version="5.3.0" />
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.14" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="8.0.14" />
     <PackageReference Include="FluentAssertions" Version="6.12.2" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\src\Pixelz.API\Pixelz.API.csproj" />
+	  <ProjectReference Include="..\..\src\Pixelz.Domain\Pixelz.Domain.csproj" />
+	  <ProjectReference Include="..\..\src\Pixelz.Application\Pixelz.Application.csproj" />
+	  <ProjectReference Include="..\..\src\Pixelz.Infrastructure\Pixelz.Infrastructure.csproj" />
   </ItemGroup>
 </Project>

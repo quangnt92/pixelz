@@ -16,17 +16,17 @@ public class OutboxMessage
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNamingPolicy   = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented = false
+        WriteIndented          = false
     };
 
     public Guid Id { get; private set; } = Guid.NewGuid();
     public string EventType { get; private set; } = null!;
     public string Payload { get; private set; } = null!;
     public OutboxStatus Status { get; private set; } = OutboxStatus.Pending;
-    public int RetryCount { get; private set; }
-    public int MaxRetries { get; private set; } = 5;
+    public int RetryCount  { get; private set; }
+    public int MaxRetries  { get; private set; } = 5;
     public DateTime NextRetryAt { get; private set; } = DateTime.UtcNow;
     public DateTime? ProcessedAt { get; private set; }
     public string? ErrorMessage { get; private set; }
@@ -41,16 +41,49 @@ public class OutboxMessage
             Payload   = JsonSerializer.Serialize(payload, payload.GetType(), JsonOptions)
         };
 
-    public IDomainEvent Deserialize() => EventType switch
+    /// <summary>
+    /// Deserializes the payload back to a domain event.
+    /// Returns null for event types that have no downstream side effects
+    /// (e.g. OrderCheckoutInitiatedEvent, PaymentFailedEvent).
+    /// </summary>
+    public IDomainEvent? TryDeserialize(ILogger logger)
     {
-        nameof(CheckoutSucceededEvent) => JsonSerializer.Deserialize<CheckoutSucceededEvent>(Payload, JsonOptions)!,
-        nameof(PaymentFailedEvent) => JsonSerializer.Deserialize<PaymentFailedEvent>(Payload, JsonOptions)!,
-        _ => throw new InvalidOperationException($"No deserializer for event type: {EventType}")
-    };
+        try
+        {
+            return EventType switch
+            {
+                // Events that trigger downstream side effects — must be handled
+                nameof(CheckoutSucceededEvent) =>
+                    JsonSerializer.Deserialize<CheckoutSucceededEvent>(Payload, JsonOptions)!,
+
+                // Events with no downstream handler — mark as processed and skip
+                nameof(OrderCheckoutInitiatedEvent) => null,
+                nameof(PaymentFailedEvent)           => null,
+
+                // Unknown event type — log and skip instead of throwing
+                _ => LogAndReturnNull(logger, EventType, Id)
+            };
+        }
+        catch (JsonException ex)
+        {
+            logger.LogError(ex,
+                "Failed to deserialize OutboxMessage. Id={Id} EventType={EventType}",
+                Id, EventType);
+            return null;
+        }
+    }
+
+    private static IDomainEvent? LogAndReturnNull(ILogger logger, string eventType, Guid id)
+    {
+        logger.LogWarning(
+            "OutboxMessage has no registered handler. Id={Id} EventType={EventType} — skipping.",
+            id, eventType);
+        return null;
+    }
 
     public void MarkAsProcessed()
     {
-        Status = OutboxStatus.Processed;
+        Status      = OutboxStatus.Processed;
         ProcessedAt = DateTime.UtcNow;
     }
 
@@ -58,7 +91,7 @@ public class OutboxMessage
     {
         RetryCount++;
         ErrorMessage = error.Length > 2000 ? error[..2000] : error;
-        Status = RetryCount >= MaxRetries ? OutboxStatus.Failed : OutboxStatus.Pending;
+        Status       = RetryCount >= MaxRetries ? OutboxStatus.Failed : OutboxStatus.Pending;
 
         // Exponential backoff: 2^retryCount minutes, capped at 60 minutes
         var delayMinutes = Math.Min(Math.Pow(2, RetryCount), 60);
@@ -70,23 +103,34 @@ public enum OutboxStatus : byte
 {
     Pending   = 0,
     Processed = 2,
-    Failed    = 3   // Max retries exceeded
+    Failed    = 3
 }
 
 // ── Background Processor ──────────────────────────────────────────────────────
 
 /// <summary>
 /// Polls OutboxMessages every 5 seconds and dispatches them to their handlers.
-/// Runs inside a scoped DI scope so handlers get fresh DbContext per batch.
+/// Events with no handler (OrderCheckoutInitiatedEvent, PaymentFailedEvent)
+/// are marked Processed immediately without error.
 /// </summary>
-public class OutboxProcessor(IServiceProvider serviceProvider, ILogger<OutboxProcessor> logger) : BackgroundService
+public class OutboxProcessor : BackgroundService
 {
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<OutboxProcessor> _logger;
+
     private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(5);
     private const int BatchSize = 20;
 
+    public OutboxProcessor(IServiceProvider serviceProvider, ILogger<OutboxProcessor> logger)
+    {
+        _serviceProvider = serviceProvider;
+        _logger          = logger;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        logger.LogInformation("OutboxProcessor started. Polling every {Interval}s", PollingInterval.TotalSeconds);
+        _logger.LogInformation(
+            "OutboxProcessor started. Polling every {Interval}s", PollingInterval.TotalSeconds);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -100,36 +144,49 @@ public class OutboxProcessor(IServiceProvider serviceProvider, ILogger<OutboxPro
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "Unhandled error in OutboxProcessor. Will retry next poll.");
+                _logger.LogError(ex, "Unhandled error in OutboxProcessor. Will retry next poll.");
             }
 
             await Task.Delay(PollingInterval, stoppingToken);
         }
 
-        logger.LogInformation("OutboxProcessor stopped.");
+        _logger.LogInformation("OutboxProcessor stopped.");
     }
 
     private async Task ProcessBatchAsync(CancellationToken ct)
     {
-        using var scope = serviceProvider.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<Persistence.PixelzDbContext>();
-        var checkoutHandler = scope.ServiceProvider.GetRequiredService<CheckoutSucceededEventHandler>();
+        using var scope         = _serviceProvider.CreateScope();
+        var db                  = scope.ServiceProvider.GetRequiredService<Persistence.PixelzDbContext>();
+        var checkoutHandler     = scope.ServiceProvider.GetRequiredService<CheckoutSucceededEventHandler>();
 
         var messages = await db.OutboxMessages
-            .Where(m => m.Status == OutboxStatus.Pending && m.NextRetryAt <= DateTime.UtcNow && m.RetryCount < m.MaxRetries)
+            .Where(m => m.Status == OutboxStatus.Pending
+                     && m.NextRetryAt <= DateTime.UtcNow
+                     && m.RetryCount  <  m.MaxRetries)
             .OrderBy(m => m.CreatedAt)
             .Take(BatchSize)
             .ToListAsync(ct);
 
-        if (messages.Count == 0) return;
+        if (messages.Count == 0)
+            return;
 
-        logger.LogDebug("OutboxProcessor: dispatching {Count} message(s)", messages.Count);
+        _logger.LogDebug("OutboxProcessor: processing {Count} message(s)", messages.Count);
 
         foreach (var msg in messages)
         {
             try
             {
-                var domainEvent = msg.Deserialize();
+                var domainEvent = msg.TryDeserialize(_logger);
+
+                if (domainEvent is null)
+                {
+                    // No handler needed — mark processed silently
+                    msg.MarkAsProcessed();
+                    _logger.LogDebug(
+                        "OutboxMessage skipped (no handler). Id={Id} EventType={EventType}",
+                        msg.Id, msg.EventType);
+                    continue;
+                }
 
                 switch (domainEvent)
                 {
@@ -138,17 +195,27 @@ public class OutboxProcessor(IServiceProvider serviceProvider, ILogger<OutboxPro
                         break;
 
                     default:
-                        logger.LogWarning("No handler for OutboxMessage EventType={EventType} Id={Id}", msg.EventType, msg.Id);
+                        // Deserializer returned a known event but no switch case exists
+                        // Mark processed to avoid infinite retry
+                        _logger.LogWarning(
+                            "No dispatch handler for EventType={EventType}. Marking processed.",
+                            msg.EventType);
                         break;
                 }
 
                 msg.MarkAsProcessed();
-                logger.LogInformation("OutboxMessage processed. Id={Id} EventType={EventType}", msg.Id, msg.EventType);
+
+                _logger.LogInformation(
+                    "OutboxMessage processed. Id={Id} EventType={EventType}",
+                    msg.Id, msg.EventType);
             }
             catch (Exception ex)
             {
                 msg.MarkAsFailed(ex.Message);
-                logger.LogError(ex,"OutboxMessage failed. Id={Id} EventType={EventType} Retry={Retry}/{Max}", msg.Id, msg.EventType, msg.RetryCount, msg.MaxRetries);
+
+                _logger.LogError(ex,
+                    "OutboxMessage failed. Id={Id} EventType={EventType} Retry={Retry}/{Max}",
+                    msg.Id, msg.EventType, msg.RetryCount, msg.MaxRetries);
             }
         }
 

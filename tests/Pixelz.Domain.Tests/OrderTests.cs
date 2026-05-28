@@ -54,7 +54,7 @@ public class OrderTests
         var result = order.AddItem("SERVICE", 1, 10m);
 
         result.IsFailure.Should().BeTrue();
-        result.Error.Should().Contain("Draft");
+        result.Error.Should().Contain("PendingPayment");
     }
 
     // ── InitiateCheckout ──────────────────────────────────────────────────────
